@@ -1,4 +1,4 @@
-// POKI sdk.js (V6.2.1)
+// POKI sdk.js (V6.3.0)
 (() => {
     "use strict";
 
@@ -10,6 +10,16 @@
         loadingGifUrl: '/scripts/videos/thumb_anim.gif',
         adTimeout: 4000, // was 1200ms -- too short for a real GPT auction to ever answer (owner-flagged root cause of 0% real fills), raised 2026-09-13
         minLoadingTime: 100,
+        applixir: {
+            // 'direct' = load AppLixir right here (use while on the sandbox key)
+            // 'bridge' = post to the approved pizzaedition.com parent (use once approved)
+            mode: 'direct',
+            sdkUrl: 'https://cdn.applixir.com/applixir.app.v6.1.0.js',
+            // SANDBOX key: test ads only, no revenue. Swap for your real key after activation.
+            apiKey: '5a4db0c5-0000-4000-8000-5a4db0c50001',
+            startTimeoutMs: 8000,    // ad must load/start by then, or fall through to GPT
+            resultTimeoutMs: 90000   // overall cap once started
+        },
         applixirBridge: {
             // games.pizzaedition.com is NOT (yet) a separately AppLixir-approved
             // domain -- only pizzaedition.com is. AppLixir reads the domain it
@@ -76,6 +86,7 @@
                 display: flex; align-items: center; justify-content: center;
             }
             .sdk-loading-spinner { width: 120px; height: 120px; }
+            .sdk-applixir-container { position: fixed; inset: 0; z-index: 1000000004; background: #000; }
             .sdk-cta-button {
                 position: absolute; top: 36px; right: 16px;
                 padding: 16px; background: #FFFFFF; color: #597ed5;
@@ -305,14 +316,17 @@
     }
 
     // --- AppLixir (primary rewarded-ad strategy, 2026-09-13) -------------------
-    // This game runs on games.pizzaedition.com, which is NOT itself an
-    // AppLixir-approved domain (only pizzaedition.com is, and getting a second
-    // domain approved is a manual 1-2 business day review). So instead of loading
-    // the AppLixir SDK and calling initializeAndOpenPlayer() here, this posts a
-    // request up to the parent /embed/<slug>/ page -- same-origin as
-    // pizzaedition.com, already approved -- which does the actual AppLixir call
-    // and posts the outcome back. Same cross-frame shape the stub already uses
-    // for pokiMessageShowLeaderboard / pokiMessageOpenExternalLink below.
+    // Two modes, picked by CONFIG.applixir.mode:
+    //   'bridge' -- this game runs on games.pizzaedition.com, which is NOT itself
+    //               an AppLixir-approved domain (only pizzaedition.com is, and
+    //               getting a second domain approved is a manual 1-2 business day
+    //               review). So this posts a request up to the parent /embed/<slug>/
+    //               page -- same-origin as pizzaedition.com, already approved --
+    //               which does the actual AppLixir call and posts the outcome back.
+    //               Same cross-frame shape the stub already uses for
+    //               pokiMessageShowLeaderboard / pokiMessageOpenExternalLink below.
+    //   'direct' -- loads the AppLixir SDK in this frame and calls
+    //               initializeAndOpenPlayer() here. Used while on the sandbox key.
     let applixirBridgeListenerInstalled = false;
     let applixirRequestSeq = 0;
     const applixirPendingRequests = new Map();
@@ -424,6 +438,106 @@
             } catch (e) {
                 finish(false, e);
             }
+        });
+    }
+
+    // --- AppLixir direct (loads the SDK in this frame) ---------------------------
+    let applixirSdkPromise = null;
+
+    function loadApplixirSdk() {
+        if (typeof window.initializeAndOpenPlayer === 'function') return Promise.resolve();
+        if (applixirSdkPromise) return applixirSdkPromise;
+        applixirSdkPromise = new Promise((resolve, reject) => {
+            const s = document.createElement('script');
+            s.src = CONFIG.applixir.sdkUrl;
+            s.async = true;
+            s.onload = () => (typeof window.initializeAndOpenPlayer === 'function'
+                ? resolve()
+                : reject(new Error('applixir_sdk_missing')));
+            s.onerror = () => { applixirSdkPromise = null; reject(new Error('applixir_sdk_blocked')); };
+            document.head.appendChild(s);
+        });
+        return applixirSdkPromise;
+    }
+
+    function showApplixirDirectRewardedAd() {
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            let completed = false;
+            let startTimer = null;
+            let resultTimer = null;
+            let container = null;
+
+            const finish = (ok, err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(startTimer);
+                clearTimeout(resultTimer);
+                if (container && container.parentNode) container.remove();
+                container = null;
+                if (ok) {
+                    console.log('[PokiSDK] AppLixir (direct): complete');
+                    trackAdEvent('ad_watched', { ad_source: 'applixir', ad_type: 'rewarded' });
+                    resolve();
+                } else {
+                    const reason = (err && err.message) || 'applixir_failed';
+                    console.warn('[PokiSDK] AppLixir (direct) failed:', reason);
+                    trackAdEvent('ad_failed', { ad_source: 'applixir', ad_type: 'rewarded', reason: String(reason).slice(0, 60) });
+                    reject(err || new Error('applixir_failed'));
+                }
+            };
+
+            loadApplixirSdk().then(() => {
+                if (settled) return;
+
+                container = document.createElement('div');
+                container.id = 'applixir-ad-container';
+                container.className = 'sdk-applixir-container';
+                document.body.appendChild(container);
+
+                startTimer = setTimeout(
+                    () => finish(false, new Error('applixir_start_timeout')),
+                    CONFIG.applixir.startTimeoutMs
+                );
+
+                const options = {
+                    apiKey: CONFIG.applixir.apiKey,
+                    injectionElementId: 'applixir-ad-container',
+                    adStatusCallbackFn: (status) => {
+                        const type = status && status.type;
+                        if (type === 'loaded' || type === 'started') {
+                            // ad is really playing: stop the short start race, allow a long result window
+                            clearTimeout(startTimer);
+                            if (!resultTimer) {
+                                resultTimer = setTimeout(
+                                    () => finish(false, new Error('applixir_result_timeout')),
+                                    CONFIG.applixir.resultTimeoutMs
+                                );
+                            }
+                            hideLoadingIndicator();
+                        } else if (type === 'complete') {
+                            completed = true;       // reward only on a genuine complete
+                        } else if (type === 'allAdsCompleted') {
+                            completed ? finish(true) : finish(false, new Error('applixir_no_complete'));
+                        } else if (type === 'skipped' || type === 'manuallyEnded') {
+                            // same "applixir_<reason>" shape isUserSkip() looks for
+                            finish(false, new Error('applixir_' + type));
+                        } else if (type === 'consentDeclined') {
+                            finish(false, new Error('applixir_consentDeclined'));
+                        }
+                    },
+                    adErrorCallbackFn: (error) => {
+                        let msg = 'error';
+                        try { msg = String(error.getError().data.errorCode || 'error'); } catch (e) {}
+                        finish(false, new Error('applixir_' + msg));
+                    }
+                };
+
+                try {
+                    const p = window.initializeAndOpenPlayer(options);
+                    if (p && typeof p.catch === 'function') p.catch((e) => finish(false, e));
+                } catch (e) { finish(false, e); }
+            }).catch((e) => finish(false, e));
         });
     }
 
@@ -632,7 +746,7 @@
         if (freezeTimer) clearTimeout(freezeTimer);
         freezeTimer = null;
 
-        ['#poki-gameplay-freeze', '.sdk-video-overlay', '.sdk-progress-bar', '.sdk-loading-overlay'].forEach(sel => {
+        ['#poki-gameplay-freeze', '.sdk-video-overlay', '.sdk-progress-bar', '.sdk-loading-overlay', '.sdk-applixir-container'].forEach(sel => {
             document.querySelectorAll(sel).forEach(el => el.remove());
         });
 
@@ -684,16 +798,19 @@
         const USER_SKIP_REASONS = ['skip', 'skipped', 'userClose', 'manuallyEnded', 'adSkippedNoReward'];
         function isUserSkip(err) {
             const msg = (err && err.message) || '';
-            // reason arrives as "applixir_bridge_<reason>" -- see finish() in
-            // the game-side bridge below.
-            return USER_SKIP_REASONS.some((r) => msg === 'applixir_bridge_' + r);
+            // reason arrives as "applixir_bridge_<reason>" from the bridge, or
+            // "applixir_<reason>" from the direct strategy.
+            return USER_SKIP_REASONS.some((r) =>
+                msg === 'applixir_bridge_' + r || msg === 'applixir_' + r);
         }
 
         let rewardGranted = false;
 
         try {
-            console.log('[PokiSDK] Strategy: AppLixir');
-            await showApplixirRewardedAd();
+            console.log('[PokiSDK] Strategy: AppLixir (' + CONFIG.applixir.mode + ')');
+            await (CONFIG.applixir.mode === 'bridge'
+                ? showApplixirRewardedAd()
+                : showApplixirDirectRewardedAd());
             console.log('[PokiSDK] ✅ AppLixir ad completed');
             rewardGranted = true;
             await hideLoadingIndicator();
@@ -872,7 +989,8 @@
     injectStyles();
     loadFallbackList();
     initGPT();
+    // preload the AppLixir SDK so the first ad request isn't waiting on the script
+    if (CONFIG.applixir.mode === 'direct') loadApplixirSdk().catch(() => {});
 
-    console.log("%c PokiSDK V6.2.1 Ready ", "background: #222; color: #fbff00; padding: 5px; border-radius: 3px;");
+    console.log("%c PokiSDK V6.3.0 Ready ", "background: #222; color: #fbff00; padding: 5px; border-radius: 3px;");
 })();
-
